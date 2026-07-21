@@ -1,11 +1,10 @@
 import os
 import time
-import threading
 import logging
-from datetime import datetime, timedelta
-from flask import Flask, send_from_directory
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+import json
+from flask import Flask, request, send_from_directory
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ---------- Setup ----------
 app = Flask(__name__)
@@ -14,6 +13,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
+WEBHOOK_URL = f"{BASE_URL}/webhook"
 
 logging.basicConfig(level=logging.INFO)
 
@@ -21,27 +21,17 @@ logging.basicConfig(level=logging.INFO)
 def cleanup_old_files():
     now = time.time()
     cutoff = now - (24 * 60 * 60)
-    deleted_count = 0
     for filename in os.listdir(UPLOAD_FOLDER):
         filepath = os.path.join(UPLOAD_FOLDER, filename)
-        if os.path.isfile(filepath):
-            if os.path.getmtime(filepath) < cutoff:
-                os.remove(filepath)
-                deleted_count += 1
-    if deleted_count > 0:
-        logging.info(f"Cleanup done: {deleted_count} files removed.")
-
-def cleanup_scheduler():
-    while True:
-        cleanup_old_files()
-        time.sleep(3600)
-
-threading.Thread(target=cleanup_scheduler, daemon=True).start()
+        if os.path.isfile(filepath) and os.path.getmtime(filepath) < cutoff:
+            os.remove(filepath)
+            logging.info(f"Deleted old file: {filename}")
 
 # ---------- Flask routes ----------
 @app.route('/')
 def wake():
-    return "Bot is awake – files auto-deleted after 24h."
+    cleanup_old_files()  # clean on wake too
+    return "Bot is awake – webhook active."
 
 @app.route('/files/<filename>')
 def serve_file(filename):
@@ -49,7 +39,17 @@ def serve_file(filename):
         return "Invalid filename", 400
     return send_from_directory(UPLOAD_FOLDER, filename)
 
-# ---------- Telegram bot ----------
+@app.route('/webhook', methods=['POST'])
+async def webhook():
+    """Receive updates from Telegram."""
+    if request.is_json:
+        data = request.get_json()
+        update = Update.de_json(data, application.bot)
+        await application.process_update(update)
+        return "OK", 200
+    return "Bad request", 400
+
+# ---------- Telegram bot handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "✨ Welcome to AR Uploader & Hosting ✨\n\n"
@@ -74,12 +74,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_size_kb = doc.file_size / 1024
     public_url = f"{BASE_URL}/files/{unique_name}"
 
-    keyboard = [
-        [
-            InlineKeyboardButton("📋 Copy Link", url=public_url),
-            InlineKeyboardButton("🌐 Visit Website", url=BASE_URL)
-        ]
-    ]
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    keyboard = [[
+        InlineKeyboardButton("📋 Copy Link", url=public_url),
+        InlineKeyboardButton("🌐 Visit Website", url=BASE_URL)
+    ]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     reply = (
@@ -92,13 +91,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(reply, reply_markup=reply_markup)
 
-def run_bot():
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.run_polling()
+# ---------- Build and set webhook ----------
+application = Application.builder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-# ---------- Start both ----------
+# Set webhook on startup (runs once)
+@app.before_first_request
+def set_webhook():
+    try:
+        application.bot.set_webhook(WEBHOOK_URL)
+        logging.info(f"Webhook set to {WEBHOOK_URL}")
+    except Exception as e:
+        logging.error(f"Webhook failed: {e}")
+
+# ---------- Run Flask ----------
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
