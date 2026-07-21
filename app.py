@@ -3,22 +3,24 @@ import time
 import logging
 import json
 import asyncio
+import threading
 from flask import Flask, request, send_from_directory
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 
-# ---------- Setup ----------
+# ---------- HARDCODED CONFIG ----------
+BOT_TOKEN = "8844521685:AAHNqPD2iuzhZt73Gn0W9CXJKtRUvJ4NK0E"
+BASE_URL = "https://mediahosting.onrender.com"
+WEBHOOK_URL = f"{BASE_URL}/webhook"
+# -------------------------------------
+
 app = Flask(__name__)
 UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:5000")
-WEBHOOK_URL = f"{BASE_URL}/webhook"
-
 bot = Bot(token=BOT_TOKEN)
 logging.basicConfig(level=logging.INFO)
 
-# ---------- Auto-cleanup (deletes files older than 24h) ----------
+# ---------- Auto-cleanup: delete files older than 24 hours ----------
 def cleanup_old_files():
     now = time.time()
     cutoff = now - 24 * 60 * 60
@@ -33,14 +35,12 @@ def cleanup_scheduler():
         cleanup_old_files()
         time.sleep(3600)  # every hour
 
-# Start the cleaner thread (daemon so it stops with the app)
-import threading
 threading.Thread(target=cleanup_scheduler, daemon=True).start()
 
 # ---------- Flask Routes ----------
 @app.route('/')
 def wake():
-    cleanup_old_files()  # also clean on wake
+    cleanup_old_files()
     return "Bot is awake – webhook active."
 
 @app.route('/files/<filename>')
@@ -54,7 +54,6 @@ def webhook():
     if not request.is_json:
         return "Bad request", 400
     data = request.get_json()
-    # Process update asynchronously in a new event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -63,19 +62,17 @@ def webhook():
         loop.close()
     return "OK", 200
 
-# ---------- Update Handlers (async) ----------
+# ---------- Update Handlers ----------
 async def process_update(data):
     update = Update.de_json(data, bot)
     if not update.message:
         return
 
-    # /start command
     if update.message.text and update.message.text.startswith('/start'):
         await start(update)
-    # Document upload
     elif update.message.document:
         await handle_document(update)
-    # You can add more handlers here (e.g., for links, /speedtest)
+    # you can add more handlers (URL upload, /speedtest) later
 
 async def start(update):
     welcome_text = (
@@ -117,22 +114,16 @@ async def handle_document(update):
     )
     await update.message.reply_text(reply, reply_markup=reply_markup)
 
-# ---------- Set webhook on first request ----------
-webhook_set = False
-
-@app.before_request
+# ---------- Set webhook on startup ----------
 def set_webhook():
-    global webhook_set
-    if not webhook_set:
-        try:
-            bot.set_webhook(WEBHOOK_URL)
-            logging.info(f"Webhook set to {WEBHOOK_URL}")
-        except Exception as e:
-            logging.error(f"Webhook failed: {e}")
-        webhook_set = True
+    try:
+        bot.set_webhook(WEBHOOK_URL)
+        logging.info(f"Webhook set to {WEBHOOK_URL}")
+    except Exception as e:
+        logging.error(f"Webhook failed: {e}")
 
 # ---------- Run ----------
 if __name__ == "__main__":
-    # Clean on startup
     cleanup_old_files()
+    set_webhook()          # set webhook once at startup
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
